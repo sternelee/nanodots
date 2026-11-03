@@ -8,6 +8,7 @@ const channel = @import("channel.zig");
 const task = @import("task.zig");
 const machine = @import("machine.zig");
 const settings = @import("settings.zig");
+const projects = @import("projects.zig");
 
 pub fn view(s: *state_mod.State, c: *ui.Context) void {
     const root = ui.div(c).row().sizeFull().bg(common.hx(common.bg));
@@ -20,5 +21,7 @@ pub fn view(s: *state_mod.State, c: *ui.Context) void {
         .task => |index| task.view(s, c, index),
         .machine => |index| machine.view(s, c, index),
         .settings => settings.view(s, c),
+        .projects => projects.listView(s, c),
+        .project => |index| projects.detailView(s, c, index),
     }
 }

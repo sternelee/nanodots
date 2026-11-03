@@ -14,6 +14,14 @@ pub const Page = union(enum) {
     task: usize,
     machine: usize,
     settings,
+    projects,
+    project: usize,
+};
+
+/// One added project and the agent runtime bound to its directory.
+pub const ProjectEntry = struct {
+    info: model.Project,
+    runtime: *agent.Runtime,
 };
 
 pub const State = struct {
@@ -28,12 +36,24 @@ pub const State = struct {
     input: ui.TextBuffer = .{},
     /// The agent turn a composer instruction opened; -1 when none.
     turn_task: i32 = -1,
+    /// The runtime and project the live turn runs on.
+    turn_runtime: ?*agent.Runtime = null,
+    turn_project: ?usize = null,
     /// Index into messages of the reply currently streaming, if any.
     streaming: i32 = -1,
     /// Index of the message collecting streamed diagnostics, if any.
     diag: i32 = -1,
     runtime: ?*agent.Runtime = null,
     cwd: []u8 = "",
+
+    /// Workspaces the owner added, each with its own fx session.
+    projects: std.ArrayList(ProjectEntry) = .empty,
+    /// Where composer instructions go: a project's directory, or null for
+    /// the launch directory.
+    target: ?usize = null,
+    add_path: ui.TextBuffer = .{},
+    add_note: []u8 = &.{},
+    add_note_err: bool = false,
 
     /// The agent settings page: editable buffers and what it shows.
     set_provider: ui.TextBuffer = .{},
@@ -77,6 +97,14 @@ pub const State = struct {
 
     pub fn destroy(self: *State) void {
         if (self.runtime) |runtime| runtime.deinit();
+        for (self.projects.items) |*entry| {
+            entry.runtime.deinit();
+            alloc.free(entry.info.name);
+            alloc.free(entry.info.path);
+        }
+        self.projects.deinit(alloc);
+        self.add_path.deinit();
+        if (self.add_note.len > 0) alloc.free(self.add_note);
         self.input.deinit();
         self.set_provider.deinit();
         self.set_model.deinit();
@@ -124,10 +152,110 @@ pub const State = struct {
         return if (t.status == .running) s.minutesAgo(t.started_at_ms) else t.started_min_ago;
     }
 
+    /// The runtime instructions should run on: the target project's, or the
+    /// launch directory's.
+    pub fn targetRuntime(s: *State) struct { runtime: *agent.Runtime, label: []const u8, project: ?usize } {
+        if (s.target) |ti| {
+            if (ti < s.projects.items.len) {
+                const entry = s.projects.items[ti];
+                return .{ .runtime = entry.runtime, .label = entry.info.name, .project = ti };
+            }
+            s.target = null;
+        }
+        return .{ .runtime = s.runtime.?, .label = "本机", .project = null };
+    }
+
+    /// Validates the path field, normalizes it and binds a new fx runtime.
+    pub fn addProject(s: *State) void {
+        const engine = @import("fx");
+        const typed = std.mem.trimEnd(u8, s.add_path.text(), " \n\t");
+        if (typed.len == 0) {
+            s.addNote("先输入项目目录", true);
+            return;
+        }
+        const io = engine.shared_io.getIo();
+        const real = engine.shared_io.realpathAlloc(alloc, typed) catch {
+            s.addNote("目录不存在或无法访问", true);
+            return;
+        };
+        var dir = std.Io.Dir.openDirAbsolute(io, real, .{}) catch {
+            alloc.free(real);
+            s.addNote("不是目录", true);
+            return;
+        };
+        dir.close(io);
+        for (s.projects.items) |entry| {
+            if (std.mem.eql(u8, entry.info.path, real)) {
+                alloc.free(real);
+                s.addNote("项目已存在", true);
+                return;
+            }
+        }
+        const name = alloc.dupe(u8, std.Io.Dir.path.basename(real)) catch {
+            alloc.free(real);
+            return;
+        };
+        const runtime = agent.Runtime.create(real) catch {
+            alloc.free(name);
+            alloc.free(real);
+            s.addNote("fx runtime 创建失败", true);
+            return;
+        };
+        runtime.setCallback(s, onAgentEvent);
+        s.projects.append(alloc, .{
+            .info = .{ .name = name, .path = real, .added_ms = engine.shared_io.milliTimestamp() },
+            .runtime = runtime,
+        }) catch {
+            runtime.deinit();
+            alloc.free(real);
+            s.addNote("添加失败", true);
+            return;
+        };
+        s.add_path.clear();
+        s.target = s.projects.items.len - 1;
+        s.addNote("项目已添加并设为目标", false);
+    }
+
+    /// Drops a project, its runtime and the target pointer if it aimed there.
+    pub fn removeProject(s: *State, index: usize) void {
+        if (index >= s.projects.items.len) return;
+        const entry = s.projects.orderedRemove(index);
+        entry.runtime.deinit();
+        alloc.free(entry.info.name);
+        alloc.free(entry.info.path);
+        if (s.target) |ti| {
+            if (ti == index) {
+                s.target = null;
+            } else if (ti > index) {
+                s.target = ti - 1;
+            }
+        }
+        if (s.turn_project) |pi| {
+            if (pi == index) {
+                s.turn_task = -1;
+                s.streaming = -1;
+                s.diag = -1;
+            }
+        }
+        switch (s.page) {
+            .project => |pi| if (pi == index) {
+                s.page = .projects;
+            },
+            else => {},
+        }
+    }
+
+    fn addNote(s: *State, text: []const u8, fail: bool) void {
+        if (s.add_note.len > 0) alloc.free(s.add_note);
+        s.add_note = alloc.dupe(u8, text) catch &.{};
+        s.add_note_err = fail;
+        if (s.window) |window| window.redraw();
+    }
+
     /// Cancel the agent turn `index` belongs to, if it is the live one.
     pub fn cancelTask(s: *State, index: usize) void {
         if (s.turn_task != index) return;
-        if (s.runtime) |runtime| runtime.cancel();
+        if (s.turn_runtime) |runtime| runtime.cancel() else if (s.runtime) |runtime| runtime.cancel();
         if (index < s.tasks.items.len) {
             s.tasks.items[index].status = .cancelled;
         }
@@ -135,6 +263,7 @@ pub const State = struct {
         s.streaming = -1;
         s.diag = -1;
         s.turn_task = -1;
+        s.turn_runtime = null;
     }
 
     /// Rereads ~/.fx/settings.json into the settings page (lines and the
@@ -337,7 +466,8 @@ pub const State = struct {
         s.pushMessage(.{ .agent = seed.hub, .time = now(), .kind = .note, .text = confirm });
     }
 
-    /// The composer submitted an instruction for the team.
+    /// The composer submitted an instruction for the team; it runs in the
+    /// target project's directory (or the launch directory).
     pub fn submit(s: *State) void {
         const text = s.input.text();
         if (text.len == 0) return;
@@ -346,7 +476,8 @@ pub const State = struct {
         s.input.clear();
         s.pushMessage(.{ .agent = null, .time = now(), .kind = .owner, .text = owned });
 
-        const runtime = s.runtime orelse return;
+        const dest = s.targetRuntime();
+        const runtime = dest.runtime;
         if (runtime.busy()) {
             const line = alloc.print("团队在忙上一个任务，先把这条排队：{s}", .{shorten(owned)}) catch return;
             s.pushMessage(.{ .agent = seed.hub, .time = now(), .kind = .note, .text = line });
@@ -356,16 +487,19 @@ pub const State = struct {
             return;
         };
         s.turn_task = @intCast(s.tasks.items.len);
+        s.turn_runtime = runtime;
+        s.turn_project = dest.project;
         const title = alloc.print("hub: {s}", .{shorten(owned)}) catch return;
         s.tasks.append(alloc, .{
             .id = "T-0107",
             .title = title,
             .role = "hub",
-            .host = "本机",
+            .host = alloc.dupe(u8, dest.label) catch "",
             .model = "fx",
             .status = .running,
             .started_min_ago = 0,
             .started_at_ms = @import("fx").shared_io.milliTimestamp(),
+            .project = dest.project,
             .request = alloc.dupe(u8, owned) catch "",
         }) catch {};
         s.streaming = @intCast(s.messages.items.len);
@@ -429,6 +563,8 @@ pub const State = struct {
                     s.pushMessage(.{ .agent = seed.hub, .time = now(), .kind = .note, .text = line });
                     s.streaming = -1;
                     s.turn_task = -1;
+                    s.turn_runtime = null;
+                    s.turn_project = null;
                 }
             },
             .failed => |bytes| {
@@ -441,6 +577,8 @@ pub const State = struct {
                     s.pushMessage(.{ .agent = seed.hub, .time = now(), .kind = .note, .text = line });
                     s.streaming = -1;
                     s.turn_task = -1;
+                    s.turn_runtime = null;
+                    s.turn_project = null;
                 }
             },
         }

@@ -27,6 +27,17 @@ fn header(s: *State, c: *ui.Context) void {
         pill.end();
         if (clicked) s.page = .channel;
     }
+    if (s.target) |ti| {
+        if (ti < s.projects.items.len) {
+            const target = ui.div(c).row().itemsCenter().gap(5).px(9).py(2).roundedFull().bg(common.hx(0x1c2b3a)).hover(common.hx(0x223448));
+            ui.text(c, c.print("⌾ {s}", .{s.projects.items[ti].info.name}), .{ .size = 12, .color = common.hx(common.blue) });
+            const clicked = target.clicked();
+            target.end();
+            if (clicked) s.page = .projects;
+        } else {
+            s.target = null;
+        }
+    }
     {
         const right = ui.div(c).row().grow().justifyEnd().itemsCenter().gap(6);
         const dot = ui.div(c).size(7, 7).circular().bg(common.hx(common.green));
@@ -168,8 +179,12 @@ fn composer(s: *State, c: *ui.Context) void {
     const wrap = ui.div(c).column().wFull().p(14).border(common.hx(common.border));
     const box = ui.div(c).row().wFull().itemsCenter().gap(10).px(13).py(9).rounded(12).bg(common.hx(0x1b1d22)).border(common.hx(common.border)).hover(common.hx(0x1e2127));
     ui.text(c, "＋", .{ .size = 16, .color = common.hx(common.muted) });
+    const placeholder = if (s.target != null and s.target.? < s.projects.items.len)
+        c.print("给团队下指令（将在 {s} 中执行）…", .{s.projects.items[s.target.?].info.name})
+    else
+        "给团队下指令，例如：把 nsh 的 gallery 在 Linux 上截图检查一遍";
     const result = ui.textField(c, &s.input, .{
-        .placeholder = "给团队下指令，例如：把 nsh 的 gallery 在 Linux 上截图检查一遍",
+        .placeholder = placeholder,
         .width = .fill,
         .bare = true,
         .size = 13.5,

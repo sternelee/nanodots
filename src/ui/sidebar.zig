@@ -12,6 +12,7 @@ pub fn view(s: *State, c: *ui.Context) void {
     const bar = ui.div(c).column().w(272).hFull().bg(common.hx(common.sidebar_bg)).border(common.hx(common.border));
     defer bar.end();
     channels(s, c);
+    projectsSection(s, c);
     decisions(s, c);
     tasks(s, c);
     machines(s, c);
@@ -32,6 +33,40 @@ fn channelRow(c: *ui.Context, title: []const u8, suffix: []const u8, active: boo
     label_row.end();
     if (suffix.len > 0) ui.text(c, suffix, .{ .size = 11, .color = common.hx(common.faint) });
     row.end();
+}
+
+fn projectsSection(s: *State, c: *ui.Context) void {
+    common.sectionLabel(c, "项目", s.projects.items.len, false);
+    for (s.projects.items, 0..) |entry, i| {
+        ui.keyInt(c, 8000 + i);
+        const active = switch (s.page) {
+            .project => |pi| pi == i,
+            else => false,
+        };
+        const base: ui.Color = if (active) common.hx(0x23262e) else common.hx(common.sidebar_bg);
+        const row = ui.div(c).row().wFull().itemsCenter().gap(8).px(10).py(5).bg(base).hover(common.hx(common.card_hover));
+        {
+            const dot = ui.div(c).size(6, 6).circular().bg(common.hx(if (s.target == i) common.green else common.blue));
+            dot.end();
+        }
+        {
+            const name_div = ui.div(c).column().grow();
+            ui.text(c, entry.info.name, .{ .size = 12.5, .color = common.hx(if (active) common.text else common.muted), .truncate = .ellipsis, .weight = if (active) .medium else .regular });
+            name_div.end();
+        }
+        {
+            const suffix_div = ui.div(c).row().justifyEnd();
+            ui.text(c, if (s.target == i) "目标" else "", .{ .size = 11, .color = common.hx(common.green) });
+            suffix_div.end();
+        }
+        const clicked = row.clicked();
+        row.end();
+        if (clicked) {
+            s.target = i;
+            s.page = .{ .project = i };
+        }
+    }
+    if (item(c, "＋ 添加项目", "", common.faint, s.page == .projects)) s.page = .projects;
 }
 
 fn decisions(s: *State, c: *ui.Context) void {

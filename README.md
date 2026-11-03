@@ -5,14 +5,15 @@ is: [nanoui](https://github.com/justrach/nanoui) draws the native desktop UI and
 the [fx](https://github.com/vercel-labs/fx) agent runtime is compiled into the
 app, in-process.
 
-You play the owner. The sidebar streams what the team is doing — decisions
-waiting on you, tasks running, queued and recent work, and the fleet of agent
-hosts. The channel is where agents report; decisions arrive as cards with
-A/B/C options, and the composer at the bottom dispatches instructions straight
-to the embedded fx agent, which streams its reply and tool calls back into the
-channel. The gear at the sidebar's bottom opens the agent settings page:
-the fx provider, model and custom base_url providers, read and written
-through fx's own `~/.fx/settings.json`.
+You play the owner. The sidebar streams what the team is doing — projects
+you added, decisions waiting on you, tasks running, queued and recent work,
+and the fleet of agent hosts. The channel is where agents report; decisions
+arrive as cards with A/B/C options, and the composer at the bottom dispatches
+instructions straight to the embedded fx agent, which streams its reply and
+tool calls back into the channel. Instructions run in the selected project's
+directory (each project keeps its own fx session); the gear at the sidebar's
+bottom opens the agent settings page: the fx provider, model and custom
+base_url providers, read and written through fx's own `~/.fx/settings.json`.
 
 Development status lives in [docs/progress.md](docs/progress.md).
 
@@ -55,10 +56,11 @@ failure is reported into the channel as a normal message.
 - `src/agent.zig` — the fx runtime on a worker thread, events pumped to the UI
   thread with `nanoui.App.after`
 - `src/state.zig` — workspace state, navigation, applying agent events, the
-  agent settings page's read/write of ~/.fx/settings.json
+  agent settings page's read/write of ~/.fx/settings.json, the projects and
+  their per-directory fx runtimes
 - `src/seed.zig` — the demo workspace (decisions, tasks, hosts, messages)
 - `src/ui/` — sidebar, channel (decision cards, composer), task page, host
-  page, agent settings page
+  page, agent settings page, projects list and project pages
 
 One nanoui rule the views follow: an opened box must be closed with an explicit
 `.end()` before its siblings open — `defer box.end()` only works for a

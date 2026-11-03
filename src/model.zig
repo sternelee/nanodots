@@ -60,6 +60,8 @@ pub const Task = struct {
     /// When a running task actually started, for the live "N 分钟" label.
     started_at_ms: i64 = 0,
     routine: bool = false,
+    /// The project this task belongs to, when dispatched through one.
+    project: ?usize = null,
     request: []const u8,
     result: []const u8 = "",
     result_status: []const u8 = "",
@@ -76,6 +78,14 @@ pub const Machine = struct {
     disk_free_gb: u32,
     tools: []const []const u8,
     heartbeat: []const u8,
+};
+
+/// A workspace directory the owner added; instructions from the composer
+/// run in the selected project's directory with its own fx session.
+pub const Project = struct {
+    name: []const u8,
+    path: []const u8,
+    added_ms: i64,
 };
 
 pub const Message = struct {
