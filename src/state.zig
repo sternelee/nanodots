@@ -16,12 +16,33 @@ pub const Page = union(enum) {
     settings,
     projects,
     project: usize,
+    session: usize,
 };
 
-/// One added project and the agent runtime bound to its directory.
+/// One added project: its directory, the agent runtime bound to it, and an
+/// interactive multi-turn session thread, like fx cli in that directory.
 pub const ProjectEntry = struct {
     info: model.Project,
     runtime: *agent.Runtime,
+    app: *State,
+    thread: std.ArrayList(model.Message) = .empty,
+    input: ui.TextBuffer = .{},
+    /// Live turn's streaming message, diagnostics collector and task, if any.
+    streaming: i32 = -1,
+    diag: i32 = -1,
+    turn_task: i32 = -1,
+
+    fn deinit(entry: *ProjectEntry) void {
+        entry.runtime.deinit();
+        entry.input.deinit();
+        for (entry.thread.items) |m| {
+            if (m.text.len > 0) alloc.free(m.text);
+        }
+        entry.thread.deinit(alloc);
+        alloc.free(entry.info.name);
+        alloc.free(entry.info.path);
+        alloc.destroy(entry);
+    }
 };
 
 pub const State = struct {
@@ -47,7 +68,7 @@ pub const State = struct {
     cwd: []u8 = "",
 
     /// Workspaces the owner added, each with its own fx session.
-    projects: std.ArrayList(ProjectEntry) = .empty,
+    projects: std.ArrayList(*ProjectEntry) = .empty,
     /// Where composer instructions go: a project's directory, or null for
     /// the launch directory.
     target: ?usize = null,
@@ -97,11 +118,7 @@ pub const State = struct {
 
     pub fn destroy(self: *State) void {
         if (self.runtime) |runtime| runtime.deinit();
-        for (self.projects.items) |*entry| {
-            entry.runtime.deinit();
-            alloc.free(entry.info.name);
-            alloc.free(entry.info.path);
-        }
+        for (self.projects.items) |entry| entry.deinit();
         self.projects.deinit(alloc);
         self.add_path.deinit();
         if (self.add_note.len > 0) alloc.free(self.add_note);
@@ -201,13 +218,18 @@ pub const State = struct {
             s.addNote("fx runtime 创建失败", true);
             return;
         };
-        runtime.setCallback(s, onAgentEvent);
-        s.projects.append(alloc, .{
-            .info = .{ .name = name, .path = real, .added_ms = engine.shared_io.milliTimestamp() },
-            .runtime = runtime,
-        }) catch {
+        const entry = alloc.create(ProjectEntry) catch {
             runtime.deinit();
+            alloc.free(name);
             alloc.free(real);
+            s.addNote("添加失败", true);
+            return;
+        };
+        entry.* = .{ .info = .{ .name = name, .path = real, .added_ms = engine.shared_io.milliTimestamp() }, .runtime = runtime, .app = s };
+        // Events from this runtime route to the session thread, not the channel.
+        runtime.setCallback(entry, onSessionEvent);
+        s.projects.append(alloc, entry) catch {
+            entry.deinit();
             s.addNote("添加失败", true);
             return;
         };
@@ -216,13 +238,11 @@ pub const State = struct {
         s.addNote("项目已添加并设为目标", false);
     }
 
-    /// Drops a project, its runtime and the target pointer if it aimed there.
+    /// Drops a project, its runtime, its session thread and target pointers.
     pub fn removeProject(s: *State, index: usize) void {
         if (index >= s.projects.items.len) return;
         const entry = s.projects.orderedRemove(index);
-        entry.runtime.deinit();
-        alloc.free(entry.info.name);
-        alloc.free(entry.info.path);
+        entry.deinit();
         if (s.target) |ti| {
             if (ti == index) {
                 s.target = null;
@@ -230,15 +250,8 @@ pub const State = struct {
                 s.target = ti - 1;
             }
         }
-        if (s.turn_project) |pi| {
-            if (pi == index) {
-                s.turn_task = -1;
-                s.streaming = -1;
-                s.diag = -1;
-            }
-        }
         switch (s.page) {
-            .project => |pi| if (pi == index) {
+            .project, .session => |pi| if (pi == index) {
                 s.page = .projects;
             },
             else => {},
@@ -509,6 +522,82 @@ pub const State = struct {
     fn pushMessage(s: *State, message: model.Message) void {
         s.messages.append(alloc, message) catch return;
         if (s.window) |window| window.redraw();
+    }
+
+    /// One turn of the project's interactive session: the input becomes an
+    /// owner message, the runtime answers into the thread (fx keeps the
+    /// session's context across turns, as the cli does).
+    pub fn sessionSubmit(s: *State, entry: *ProjectEntry) void {
+        _ = s;
+        const text = entry.input.text();
+        if (text.len == 0) return;
+        const owned = alloc.dupe(u8, text) catch return;
+        defer alloc.free(owned);
+        entry.input.clear();
+        entry.thread.append(alloc, .{ .agent = null, .time = now(), .kind = .owner, .text = alloc.dupe(u8, owned) catch return }) catch return;
+        if (entry.runtime.busy()) {
+            entry.thread.append(alloc, .{ .agent = seed.hub, .time = now(), .kind = .note, .text = "上一个回合还在运行，等它结束再发" }) catch {};
+        }
+        entry.runtime.start(owned) catch {
+            entry.thread.append(alloc, .{ .agent = seed.hub, .time = now(), .kind = .note, .text = "fx agent 启动失败" }) catch {};
+            return;
+        };
+        entry.streaming = @intCast(entry.thread.items.len);
+        entry.thread.append(alloc, .{ .agent = seed.hub, .time = now(), .kind = .note, .text = "" }) catch {};
+        if (entry.app.window) |window| window.redraw();
+    }
+
+    /// fx events from a project runtime land here (the callback's context is
+    /// the ProjectEntry), appending to its session thread.
+    fn onSessionEvent(context: ?*anyopaque, event: agent.Event) void {
+        const entry: *ProjectEntry = @ptrCast(@alignCast(context.?));
+        switch (event) {
+            .text => |bytes| {
+                entry.diag = -1;
+                if (entry.streaming >= 0) {
+                    const message = &entry.thread.items[@intCast(entry.streaming)];
+                    const grown = alloc.alloc(u8, message.text.len + bytes.len) catch return;
+                    @memcpy(grown[0..message.text.len], message.text);
+                    @memcpy(grown[message.text.len..], bytes);
+                    message.text = grown;
+                }
+            },
+            .diagnostic => |bytes| {
+                if (std.mem.startsWith(u8, bytes, "Running ")) return;
+                if (entry.diag >= 0 and entry.diag < entry.thread.items.len) {
+                    const message = &entry.thread.items[@intCast(entry.diag)];
+                    const grown = alloc.alloc(u8, message.text.len + 1 + bytes.len) catch return;
+                    @memcpy(grown[0..message.text.len], message.text);
+                    grown[message.text.len] = '\n';
+                    @memcpy(grown[message.text.len + 1 ..], bytes);
+                    message.text = grown;
+                } else {
+                    entry.thread.append(alloc, .{ .agent = seed.hub, .time = now(), .kind = .diag, .text = alloc.dupe(u8, bytes) catch return }) catch return;
+                    entry.diag = @intCast(entry.thread.items.len - 1);
+                }
+            },
+            .tool => |call| {
+                entry.diag = -1;
+                var output: []const u8 = std.mem.trimEnd(u8, call.output, "\n");
+                if (output.len > 240) output = output[0..240];
+                const line = if (output.len > 0)
+                    alloc.print("{s} · {s}\n{s}", .{ call.name, call.status, output }) catch return
+                else
+                    alloc.print("{s} · {s}", .{ call.name, call.status }) catch return;
+                entry.thread.append(alloc, .{ .agent = seed.hub, .time = now(), .kind = .tool, .text = line }) catch {};
+            },
+            .done => {
+                entry.diag = -1;
+                entry.streaming = -1;
+            },
+            .failed => |bytes| {
+                entry.diag = -1;
+                entry.streaming = -1;
+                const line = alloc.print("fx agent 失败：{s}", .{bytes}) catch return;
+                entry.thread.append(alloc, .{ .agent = seed.hub, .time = now(), .kind = .note, .text = line }) catch {};
+            },
+        }
+        if (entry.app.window) |window| window.redraw();
     }
 
     /// fx runtime events arrive on the UI thread through this.

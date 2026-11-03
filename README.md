@@ -11,9 +11,11 @@ and the fleet of agent hosts. The channel is where agents report; decisions
 arrive as cards with A/B/C options, and the composer at the bottom dispatches
 instructions straight to the embedded fx agent, which streams its reply and
 tool calls back into the channel. Instructions run in the selected project's
-directory (each project keeps its own fx session); the gear at the sidebar's
-bottom opens the agent settings page: the fx provider, model and custom
-base_url providers, read and written through fx's own `~/.fx/settings.json`.
+directory (each project keeps its own fx session), and every project also
+opens an interactive multi-turn agent session — like fx cli or an editor
+chat panel in that directory. The gear at the sidebar's bottom opens the
+agent settings page: the fx provider, model and custom base_url providers,
+read and written through fx's own `~/.fx/settings.json`.
 
 Development status lives in [docs/progress.md](docs/progress.md).
 

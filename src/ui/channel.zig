@@ -68,7 +68,7 @@ fn messages(s: *State, c: *ui.Context) void {
 }
 
 /// An agent report: avatar, name and time, then the body.
-fn note(c: *ui.Context, m: model.Message) void {
+pub fn note(c: *ui.Context, m: model.Message) void {
     const row = ui.div(c).row().wFull().gap(10);
     if (m.agent) |a| {
         common.avatar(c, a, 30);
@@ -93,7 +93,7 @@ fn note(c: *ui.Context, m: model.Message) void {
 }
 
 /// The owner's reply, right-aligned on a raised bubble.
-fn owner(c: *ui.Context, m: model.Message) void {
+pub fn owner(c: *ui.Context, m: model.Message) void {
     const row = ui.div(c).row().wFull().justifyEnd();
     const bubble = ui.div(c).column().maxW(520).gap(3).px(13).py(9).rounded(12).bg(common.hx(0x2a2d35));
     ui.text(c, m.text, .{ .size = 13.5, .color = common.hx(common.text), .wrap = true, .leading = 1.4 });
@@ -103,7 +103,7 @@ fn owner(c: *ui.Context, m: model.Message) void {
 }
 
 /// A tool call the agent made: right-aligned, monospaced, dimmed.
-fn toolRow(c: *ui.Context, m: model.Message) void {
+pub fn toolRow(c: *ui.Context, m: model.Message) void {
     const row = ui.div(c).row().wFull().justifyEnd();
     const card = ui.div(c).column().maxW(560).px(11).py(7).rounded(8).bg(common.hx(0x1b1d22)).border(common.hx(common.border));
     ui.text(c, m.text, .{ .size = 12, .mono = true, .color = common.hx(common.muted), .wrap = true, .leading = 1.35 });
@@ -112,7 +112,7 @@ fn toolRow(c: *ui.Context, m: model.Message) void {
 }
 
 /// The command output fx streamed mid-turn: a full-width monospaced card.
-fn diagRow(c: *ui.Context, m: model.Message) void {
+pub fn diagRow(c: *ui.Context, m: model.Message) void {
     const card = ui.div(c).column().wFull().px(11).py(7).rounded(8).bg(common.hx(0x15171b)).border(common.hx(common.border));
     ui.text(c, m.text, .{ .size = 12, .mono = true, .color = common.hx(common.faint), .wrap = true, .leading = 1.3 });
     card.end();

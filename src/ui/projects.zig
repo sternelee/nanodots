@@ -112,6 +112,14 @@ pub fn detailView(s: *State, c: *ui.Context, index: usize) void {
     section(c, "操作");
     {
         const card = ui.div(c).row().wFull().itemsCenter().gap(10).p(13).rounded(10).bg(common.hx(common.card)).border(common.hx(common.border));
+        {
+            const button = ui.div(c).row().itemsCenter().gap(5).px(12).py(5).rounded(7).bg(common.hx(0x2f6feb)).hover(common.hx(0x3a7dff));
+            ui.text(c, "进入 agent 会话 →", .{ .size = 13, .weight = .medium, .color = .white });
+            const clicked = button.clicked();
+            button.end();
+            if (clicked) s.page = .{ .session = index };
+        }
+        ui.text(c, "多轮对话，回合在此目录执行，上下文跨回合保持（fx cli 式会话）。", .{ .size = 12.5, .color = common.hx(common.muted) });
         if (s.target == index) {
             const chip_div = ui.div(c).row().itemsCenter().px(12).py(5).rounded(7).bg(common.hx(0x233628));
             ui.text(c, "✓ 已是任务目标", .{ .size = 13, .weight = .medium, .color = common.hx(common.green) });
