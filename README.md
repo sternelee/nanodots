@@ -6,15 +6,19 @@ the [fx](https://github.com/vercel-labs/fx) agent runtime is compiled into the
 app, in-process.
 
 You play the owner. The sidebar streams what the team is doing — projects
-you added, decisions waiting on you, tasks running, queued and recent work,
-and the fleet of agent hosts. The channel is where agents report; decisions
-arrive as cards with A/B/C options, and the composer at the bottom dispatches
-instructions straight to the embedded fx agent, which streams its reply and
-tool calls back into the channel. Instructions run in the selected project's
-directory (each project keeps its own fx session), and every project also
-opens an interactive multi-turn agent session — like fx cli or an editor
-chat panel in that directory. The gear at the sidebar's bottom opens the
-agent settings page: the fx provider, model and custom base_url providers,
+you added, repos being watched, decisions waiting on you, tasks running,
+queued and recent work, and the fleet of agent hosts. The channel is where
+agents report; decisions arrive as cards with A/B/C options, and the composer
+at the bottom dispatches instructions straight to the embedded fx agent, which
+streams its reply and tool calls back into the channel. Instructions run in
+the selected project's directory (each project keeps its own fx session), and
+every project also opens an interactive multi-turn agent session — like fx
+cli or an editor chat panel in that directory. Watches poll GitHub repos on a
+schedule (a Grok Bot-style routine): at each interval the app wakes a dedicated
+fx session that checks the repo with `gh` (or the GitHub API), reports new
+PRs/issues to the channel and stays quiet when nothing changed; the watch list
+persists in `~/.nanodot/watchers.json`. The gear at the sidebar's bottom opens
+the agent settings page: the fx provider, model and custom base_url providers,
 read and written through fx's own `~/.fx/settings.json`.
 
 Development status lives in [docs/progress.md](docs/progress.md).
@@ -59,10 +63,14 @@ failure is reported into the channel as a normal message.
   thread with `nanoui.App.after`
 - `src/state.zig` — workspace state, navigation, applying agent events, the
   agent settings page's read/write of ~/.fx/settings.json, the projects and
-  their per-directory fx runtimes
+  their per-directory fx runtimes, and the repo watches: a 1-second scheduler
+  (`nanoui.App.after`) wakes a dedicated fx session per watcher, the reply is
+  parsed (无新动态 stays quiet, findings go to the channel), the list is
+  persisted to `~/.nanodot/watchers.json`
 - `src/seed.zig` — the demo workspace (decisions, tasks, hosts, messages)
 - `src/ui/` — sidebar, channel (decision cards, composer), task page, host
-  page, agent settings page, projects list and project pages
+  page, agent settings page, projects list and project pages, watch list and
+  watcher pages
 
 One nanoui rule the views follow: an opened box must be closed with an explicit
 `.end()` before its siblings open — `defer box.end()` only works for a

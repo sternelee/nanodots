@@ -13,6 +13,7 @@ pub fn view(s: *State, c: *ui.Context) void {
     defer bar.end();
     channels(s, c);
     projectsSection(s, c);
+    watchesSection(s, c);
     decisions(s, c);
     tasks(s, c);
     machines(s, c);
@@ -67,6 +68,48 @@ fn projectsSection(s: *State, c: *ui.Context) void {
         }
     }
     if (item(c, "＋ 添加项目", "", common.faint, s.page == .projects)) s.page = .projects;
+}
+
+fn watchesSection(s: *State, c: *ui.Context) void {
+    var active: usize = 0;
+    for (s.watchers.items) |entry| {
+        if (entry.enabled) active += 1;
+    }
+    common.sectionLabel(c, "监听", active, false);
+    for (s.watchers.items, 0..) |entry, i| {
+        ui.keyInt(c, 9000 + i);
+        const busy = entry.runtime.busy();
+        const active_row = pageIsWatch(s, i);
+        const base: ui.Color = if (active_row) common.hx(0x23262e) else common.hx(common.sidebar_bg);
+        const row = ui.div(c).row().wFull().itemsCenter().gap(8).px(10).py(5).bg(base).hover(common.hx(common.card_hover));
+        {
+            const dot = ui.div(c).size(6, 6).circular().bg(common.hx(if (busy) common.orange else if (entry.enabled) common.blue else common.faint));
+            dot.end();
+        }
+        {
+            const name_div = ui.div(c).column().grow();
+            ui.text(c, entry.info.repo, .{ .size = 12.5, .color = common.hx(if (active_row) common.text else common.muted), .truncate = .ellipsis });
+            name_div.end();
+        }
+        {
+            const suffix_div = ui.div(c).row().justifyEnd();
+            const suffix: []const u8 = if (busy)
+                "检查中"
+            else if (!entry.enabled)
+                "已暂停"
+            else blk: {
+                const now_ms = @import("fx").shared_io.milliTimestamp();
+                const mins = @divFloor(entry.next_fire_ms - now_ms + 59_999, 60_000);
+                break :blk if (mins <= 0) "即将" else c.print("{d} 分", .{mins});
+            };
+            ui.text(c, suffix, .{ .size = 11, .color = common.hx(if (busy) common.orange else common.faint), .tabular = true });
+            suffix_div.end();
+        }
+        const clicked = row.clicked();
+        row.end();
+        if (clicked) s.page = .{ .watch = i };
+    }
+    if (item(c, "＋ 添加监听", "", common.faint, s.page == .watchers)) s.page = .watchers;
 }
 
 fn decisions(s: *State, c: *ui.Context) void {
@@ -139,6 +182,13 @@ fn pageIsTask(s: *State, index: usize) bool {
 fn pageIsMachine(s: *State, index: usize) bool {
     return switch (s.page) {
         .machine => |i| i == index,
+        else => false,
+    };
+}
+
+fn pageIsWatch(s: *State, index: usize) bool {
+    return switch (s.page) {
+        .watch => |i| i == index,
         else => false,
     };
 }

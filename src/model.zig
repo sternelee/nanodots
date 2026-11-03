@@ -88,6 +88,18 @@ pub const Project = struct {
     added_ms: i64,
 };
 
+/// A GitHub repo watched for new PRs/issues. The app wakes the embedded
+/// agent on an interval to check it (a Grok Bot-style routine): the reply
+/// "无新动态" keeps it quiet, anything else is reported to the channel.
+pub const Watch = struct {
+    /// "owner/repo" on GitHub.
+    repo: []const u8,
+    watch_prs: bool,
+    watch_issues: bool,
+    interval_min: u32,
+    added_ms: i64,
+};
+
 pub const Message = struct {
     pub const Kind = enum {
         /// A plain agent report.

@@ -10,6 +10,8 @@ const Message = model.Message;
 pub const ferris = Agent{ .name = "Ferris", .letter = 'F', .color = 0x8a9a5b };
 pub const hermes = Agent{ .name = "Hermes", .letter = 'H', .color = 0xb0719e };
 pub const hub = Agent{ .name = "hub", .letter = 'h', .color = 0x6e7681 };
+/// The repo watcher's reports in the channel.
+pub const watcher = Agent{ .name = "watcher", .letter = 'w', .color = 0x58a6ff };
 
 pub const decisions = [_]Decision{
     .{
