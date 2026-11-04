@@ -66,6 +66,12 @@ pub const WatchEntry = struct {
     next_fire_ms: i64 = 0,
     /// Short version of the last reply, fed into the next instruction.
     last_result: []u8 = &.{},
+    /// Numbers the owner dismissed; never reported again.
+    ignored: std.ArrayList(u32) = .empty,
+    /// Everything already reported (findings and baseline items); the check
+    /// instruction lists these so restarts diff against them, not just the
+    /// fx session's memory.
+    reported: std.ArrayList(u32) = .empty,
 
     fn deinit(entry: *WatchEntry) void {
         entry.runtime.deinit();
@@ -73,6 +79,8 @@ pub const WatchEntry = struct {
             if (m.text.len > 0) alloc.free(m.text);
         }
         entry.thread.deinit(alloc);
+        entry.ignored.deinit(alloc);
+        entry.reported.deinit(alloc);
         if (entry.last_result.len > 0) alloc.free(entry.last_result);
         alloc.free(entry.info.repo);
         alloc.destroy(entry);
@@ -121,8 +129,28 @@ pub const State = struct {
     watch_note_err: bool = false,
     /// Running id sequence for watcher check tasks (W-0001, …).
     watch_seq: u32 = 0,
+    /// Id sequences past the seed data: decisions D-0011…, tasks T-0110….
+    decision_seq: u32 = 10,
+    task_seq: u32 = 110,
     /// Whether the 1s scheduler pump has been armed (from the first frame).
     tick_armed: bool = false,
+
+    /// GitHub webhook receiver (the settings page configures it). Inbound
+    /// deliveries wake matching watchers immediately; polling stays as the
+    /// safety net.
+    webhook: ?*@import("webhook.zig").Server = null,
+    wh_enabled: bool = false,
+    wh_port: u16 = 9781,
+    wh_port_buf: ui.TextBuffer = .{},
+    wh_secret_buf: ui.TextBuffer = .{},
+    wh_secret: []u8 = &.{},
+    wh_token: []u8 = &.{},
+    /// Derived hook URL, shown in a copyable field on the settings page.
+    wh_url_buf: ui.TextBuffer = .{},
+    /// Newest-last log of received deliveries, capped at 20.
+    wh_events: std.ArrayList(@import("webhook.zig").Event) = .empty,
+    wh_note: []u8 = &.{},
+    wh_note_err: bool = false,
 
     /// The agent settings page: editable buffers and what it shows.
     set_provider: ui.TextBuffer = .{},
@@ -162,6 +190,7 @@ pub const State = struct {
             });
         }
         self.loadWatchers();
+        self.loadWebhook();
         return self;
     }
 
@@ -171,10 +200,33 @@ pub const State = struct {
         self.projects.deinit(alloc);
         for (self.watchers.items) |entry| entry.deinit();
         self.watchers.deinit(alloc);
+        if (self.webhook) |server| server.stop();
+        for (self.wh_events.items) |e| @import("webhook.zig").freeEvent(e);
+        self.wh_events.deinit(alloc);
+        self.wh_port_buf.deinit();
+        self.wh_secret_buf.deinit();
+        self.wh_url_buf.deinit();
+        if (self.wh_secret.len > 0) alloc.free(self.wh_secret);
+        if (self.wh_token.len > 0) alloc.free(self.wh_token);
+        if (self.wh_note.len > 0) alloc.free(self.wh_note);
         self.add_path.deinit();
         if (self.add_note.len > 0) alloc.free(self.add_note);
         self.watch_repo.deinit();
         if (self.watch_note.len > 0) alloc.free(self.watch_note);
+        for (self.decisions.items) |d| {
+            if (!d.owned) continue;
+            alloc.free(d.id);
+            alloc.free(d.title);
+            alloc.free(d.body);
+            alloc.free(d.outcome);
+            for (d.options) |o| alloc.free(o.detail);
+            alloc.free(d.options);
+            if (d.watch) |w| {
+                alloc.free(w.repo);
+                alloc.free(w.numbers);
+                alloc.free(w.context);
+            }
+        }
         self.input.deinit();
         self.set_provider.deinit();
         self.set_model.deinit();
@@ -434,19 +486,51 @@ pub const State = struct {
         else
             "新 issue";
 
+        var ig: std.ArrayList(u8) = .empty;
+        defer ig.deinit(alloc);
+        if (entry.ignored.items.len > 0) {
+            ig.appendSlice(alloc, "\n已忽略、不要报告的条目：") catch {};
+            const ig_label = formatNumbers(entry.ignored.items);
+            defer alloc.free(ig_label);
+            ig.appendSlice(alloc, ig_label) catch {};
+            ig.appendSlice(alloc, "。") catch {};
+        }
+        const ignored_clause: []const u8 = ig.items;
+
+        var rp: std.ArrayList(u8) = .empty;
+        defer rp.deinit(alloc);
+        if (entry.reported.items.len > 0) {
+            rp.appendSlice(alloc, "\n上次已汇报（不要重复报告）：") catch {};
+            const recent = if (entry.reported.items.len > 24) entry.reported.items[entry.reported.items.len - 24 ..] else entry.reported.items;
+            const rp_label = formatNumbers(recent);
+            defer alloc.free(rp_label);
+            rp.appendSlice(alloc, rp_label) catch {};
+            rp.appendSlice(alloc, "。") catch {};
+        }
+        const reported_clause: []const u8 = rp.items;
+
         var tbuf: [8]u8 = undefined;
         const instruction = if (entry.checks == 1)
             alloc.print(
                 \\[监听] 检查 GitHub 仓库 {s} 的{s}。
                 \\用 gh 查询：gh pr list -R {s} --json number,title,author,createdAt,url --limit 30（issue 用 gh issue list，参数相同）；gh 不可用时用 curl 调 https://api.github.com/repos/{s}/pulls 或 /issues。
-                \\这是首次检查：把当前 open 的最新 3 条作为基线列出来，回复以「基线已建立」结尾。
-            , .{ entry.info.repo, scope, entry.info.repo, entry.info.repo }) catch return
+                \\这是首次检查：把当前 open 的最新 3 条作为基线列出来（跳过已忽略条目），回复以「基线已建立」结尾。{s}
+            , .{ entry.info.repo, scope, entry.info.repo, entry.info.repo, reported_clause }) catch return
+        else if (entry.reported.items.len == 0)
+            // No history to diff against (e.g. the baseline found nothing
+            // and items appeared since): list the current top, which also
+            // bootstraps the reported set.
+            alloc.print(
+                \\[监听] 检查 GitHub 仓库 {s} 的{s}。
+                \\用 gh 查询：gh pr list -R {s} --json number,title,author,createdAt,url --limit 30（issue 用 gh issue list，参数相同）；gh 不可用时用 curl 调 https://api.github.com/repos/{s}/pulls 或 /issues。
+                \\没有历史记录可对比：把当前 open 的最新 3 条列出来（跳过已忽略条目），逐条「#编号 标题 — 链接」加一句中文说明，结尾写「共 N 条新动态」；一个 open 条目都没有就只回复：无新动态{s}
+            , .{ entry.info.repo, scope, entry.info.repo, entry.info.repo, ignored_clause }) catch return
         else
             alloc.print(
                 \\[监听] 检查 GitHub 仓库 {s} 的{s}（上次检查 {s}，结论：{s}）。
                 \\用 gh 查询：gh pr list -R {s} --json number,title,author,createdAt,url --limit 30（issue 用 gh issue list，参数相同）；gh 不可用时用 curl 调 https://api.github.com/repos/{s}/pulls 或 /issues。
-                \\对比本会话里已经汇报过的条目，只报告新出现的：逐条「#编号 标题 — 链接」加一句中文说明，结尾写「共 N 条新动态」。
-                \\没有新条目就只回复：无新动态
+                \\对比上次已汇报的编号与本会话历史，只报告全新条目：逐条「#编号 标题 — 链接」加一句中文说明，结尾写「共 N 条新动态」。{s}
+                \\没有新条目就只回复：无新动态{s}
             , .{
                 entry.info.repo,
                 scope,
@@ -454,6 +538,8 @@ pub const State = struct {
                 entry.last_result,
                 entry.info.repo,
                 entry.info.repo,
+                reported_clause,
+                ignored_clause,
             }) catch return;
         defer alloc.free(instruction);
 
@@ -576,17 +662,39 @@ pub const State = struct {
             const msg = alloc.print("【{s}】{s}", .{ entry.info.repo, line }) catch return;
             s.pushMessage(.{ .agent = seed.watcher, .time = now(), .kind = .note, .text = msg });
         } else if (std.mem.indexOf(u8, reply, "基线已建立") != null) {
+            const numbers = parseNumbers(reply);
+            defer alloc.free(numbers);
+            mergeReported(entry, numbers);
             const msg = alloc.print("【{s}】基线已建立：{s}", .{ entry.info.repo, line }) catch return;
             s.pushMessage(.{ .agent = seed.watcher, .time = now(), .kind = .note, .text = msg });
         } else if (std.mem.indexOf(u8, reply, "无新动态") != null) {
             // Quiet per the routine's instruction: nothing worth surfacing.
         } else if (reply.len > 0) {
             entry.findings += 1;
-            const body = if (reply.len > 400) reply[0..400] else reply;
-            const msg = alloc.print("【{s}】\n{s}", .{ entry.info.repo, body }) catch return;
-            s.pushMessage(.{ .agent = seed.watcher, .time = now(), .kind = .note, .text = msg });
+            // New PRs/issues: ask the owner what to do about them. The
+            // numbers also join the reported set so restarts never
+            // re-report them.
+            const numbers = parseNumbers(reply);
+            mergeReported(entry, numbers);
+            s.pushWatchDecision(entry, reply, numbers);
         }
         s.saveWatchers();
+    }
+
+    /// Numbers join the watcher's reported set (deduped, capped), so later
+    /// checks — even after a restart — never treat them as new.
+    fn mergeReported(entry: *WatchEntry, numbers: []const u32) void {
+        for (numbers) |n| {
+            var exists = false;
+            for (entry.reported.items) |m| {
+                if (m == n) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) entry.reported.append(alloc, n) catch {};
+        }
+        while (entry.reported.items.len > 100) _ = entry.reported.orderedRemove(0);
     }
 
     fn setLastResult(s: *State, entry: *WatchEntry, line: []const u8) void {
@@ -595,9 +703,309 @@ pub const State = struct {
         entry.last_result = alloc.dupe(u8, line) catch &.{};
     }
 
+    /// A watcher's finding becomes a decision card in the channel: A 快速
+    ///审阅, B 派完整审查任务, C 忽略 (the numbers go on the watcher's
+    /// persisted ignore list and are never reported again).
+    fn pushWatchDecision(s: *State, entry: *WatchEntry, reply: []const u8, numbers: []const u32) void {
+        var watcher_index: ?usize = null;
+        for (s.watchers.items, 0..) |w, i| {
+            if (w == entry) {
+                watcher_index = i;
+                break;
+            }
+        }
+        const wi = watcher_index orelse {
+            alloc.free(numbers);
+            return;
+        };
+        s.decision_seq += 1;
+        const id = alloc.print("D-{d:0>4}", .{s.decision_seq}) catch return;
+        const title = alloc.print("处理 {s} 的新发现？", .{entry.info.repo}) catch return;
+        const body_reply = if (reply.len > 280) reply[0..280] else reply;
+        const body = alloc.print("watcher 在 {s} 发现：\n\n{s}", .{ entry.info.repo, body_reply }) catch return;
+        const nums_label = formatNumbers(numbers);
+        defer alloc.free(nums_label);
+        const outcome = alloc.print("按所选方案处理 {s} 的新条目（{s}）", .{ entry.info.repo, nums_label }) catch return;
+        const context = alloc.dupe(u8, if (reply.len > 200) reply[0..200] else reply) catch return;
+
+        const options = alloc.alloc(model.Option, 3) catch return;
+        // Keep each detail short: a single rendered line, so the options
+        // stay readable — and exactly matchable by the headless tester.
+        options[0] = .{
+            .label = "A",
+            .detail = alloc.print("快速审阅 — 拉 diff 给审阅意见", .{}) catch return,
+        };
+        options[1] = .{
+            .label = "B",
+            .detail = alloc.print("派任务 — 完整审查，输出结构化报告", .{}) catch return,
+        };
+        options[2] = .{
+            .label = "C",
+            .detail = alloc.print("忽略 — 不再汇报这些条目", .{}) catch return,
+        };
+
+        s.decisions.append(alloc, .{
+            .id = id,
+            .title = title,
+            .body = body,
+            .options = options,
+            .outcome = outcome,
+            .owned = true,
+            .watch = .{
+                .watcher = wi,
+                .repo = alloc.dupe(u8, entry.info.repo) catch return,
+                .numbers = numbers,
+                .context = context,
+            },
+        }) catch return;
+        s.pushMessage(.{
+            .agent = seed.watcher,
+            .time = now(),
+            .kind = .decision,
+            .text = "",
+            .decision = @intCast(s.decisions.items.len - 1),
+        });
+    }
+
+    /// Runs the review the owner picked on a watcher decision: option A is a
+    /// quick pass, B a full review; both stream through the hub runtime as a
+    /// tracked task. Issue-only watches review issues; PR watches diff PRs.
+    fn dispatchWatchReview(s: *State, w: model.WatchRef, deep: bool) void {
+        if (w.watcher >= s.watchers.items.len) return;
+        const watch_info = s.watchers.items[w.watcher].info;
+        if (!std.mem.eql(u8, watch_info.repo, w.repo)) return;
+        const issue_mode = watch_info.watch_issues and !watch_info.watch_prs;
+        const nums_label = formatNumbers(w.numbers);
+        defer alloc.free(nums_label);
+
+        const instruction = if (w.numbers.len == 0)
+            alloc.print("审查 GitHub 仓库 {s} 的这些新条目：\n{s}\n\n用 gh（或 curl GitHub API）找到相关的 PR 或 issue，逐个拉取内容审阅：问题列表（标严重度）、测试缺口、处理建议。中文回复。", .{
+                w.repo,
+                w.context,
+            }) catch return
+        else if (issue_mode)
+            alloc.print("查看 GitHub 仓库 {s} 的这些 issue：{s}。对每个编号运行 gh issue view <编号> -R {s} --json title,body,author,comments（gh 不可用就 curl https://api.github.com/repos/{s}/issues/<编号>），总结内容并评估是否需要处理，每个 issue 给出处理建议。中文回复。", .{ w.repo, nums_label, w.repo, w.repo }) catch return
+        else if (deep)
+            alloc.print("完整审查 GitHub 仓库 {s} 的这些 PR：{s}。对每个编号运行 gh pr diff {s} <编号>（gh 不可用就 curl -L https://github.com/{s}/pull/<编号>.diff）拉取 diff，逐文件检查正确性、安全、性能与测试覆盖。输出结构化审查报告，每个 PR 一节：问题清单（严重度 + 文件:行）、测试缺口、是否可合并。中文回复。", .{ w.repo, nums_label, w.repo, w.repo }) catch return
+        else
+            alloc.print("快速审阅 GitHub 仓库 {s} 的这些 PR：{s}。对每个编号运行 gh pr diff {s} <编号>（gh 不可用就 curl -L https://github.com/{s}/pull/<编号>.diff）拉取 diff，检查正确性与破坏性变更，每个 PR 给出问题列表（标严重度）和合并建议。中文回复。", .{ w.repo, nums_label, w.repo, w.repo }) catch return;
+        defer alloc.free(instruction);
+
+        const runtime = s.runtime.?;
+        if (runtime.busy()) {
+            s.pushMessage(.{ .agent = seed.hub, .time = now(), .kind = .note, .text = "团队在忙上一个任务，这条审查先记下，空闲后重新发起" });
+            return;
+        }
+        runtime.start(instruction) catch {
+            s.pushMessage(.{ .agent = seed.hub, .time = now(), .kind = .note, .text = "fx agent 启动失败" });
+            return;
+        };
+        s.task_seq += 1;
+        const id = alloc.print("T-{d:0>4}", .{s.task_seq}) catch return;
+        const title = alloc.print("review: {s} {s}", .{ w.repo, nums_label }) catch return;
+        s.tasks.append(alloc, .{
+            .id = id,
+            .title = shorten(title),
+            .role = "hub",
+            .host = "本机",
+            .model = "fx",
+            .status = .running,
+            .started_min_ago = 0,
+            .started_at_ms = @import("fx").shared_io.milliTimestamp(),
+            .request = alloc.dupe(u8, instruction) catch "",
+        }) catch {};
+        s.turn_task = @intCast(s.tasks.items.len - 1);
+        s.turn_runtime = runtime;
+        s.turn_project = null;
+        s.streaming = @intCast(s.messages.items.len);
+        s.pushMessage(.{ .agent = seed.hub, .time = now(), .kind = .note, .text = "" });
+    }
+
+    /// Option C on a watcher decision: the numbers join the watcher's
+    /// ignore list (persisted), so later checks never report them again.
+    fn ignoreWatchFinding(s: *State, w: model.WatchRef) void {
+        if (w.watcher >= s.watchers.items.len) return;
+        const entry = s.watchers.items[w.watcher];
+        if (!std.mem.eql(u8, entry.info.repo, w.repo)) return;
+        for (w.numbers) |n| {
+            var exists = false;
+            for (entry.ignored.items) |m| {
+                if (m == n) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) entry.ignored.append(alloc, n) catch {};
+        }
+        s.saveWatchers();
+    }
+
+    // --- GitHub webhook receiver ------------------------------------------
+
+    /// Loads ~/.nanodot/settings.json, generates the hook token on first
+    /// run, and starts the receiver when enabled.
+    fn loadWebhook(s: *State) void {
+        const engine = @import("fx");
+        const home = engine.shared_io.homeDir() orelse return;
+        const path = alloc.print("{s}/.nanodot/settings.json", .{home}) catch return;
+        defer alloc.free(path);
+        if (readFile(path)) |data| {
+            defer alloc.free(data);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, data, .{}) catch null;
+            if (parsed) |*p| {
+                defer p.deinit();
+                if (p.value == .object) {
+                    if (p.value.object.get("webhook")) |wh| {
+                        if (wh == .object) {
+                            const o = wh.object;
+                            if (o.get("enabled")) |v| {
+                                if (v == .bool) s.wh_enabled = v.bool;
+                            }
+                            if (o.get("port")) |v| {
+                                if (v == .integer) s.wh_port = @intCast(@max(1, @min(65535, v.integer)));
+                            }
+                            if (o.get("secret")) |v| {
+                                if (v == .string and v.string.len > 0) {
+                                    s.wh_secret = alloc.dupe(u8, v.string) catch &.{};
+                                }
+                            }
+                            if (o.get("token")) |v| {
+                                if (v == .string and v.string.len > 0) {
+                                    s.wh_token = alloc.dupe(u8, v.string) catch &.{};
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        var need_save = false;
+        if (s.wh_token.len == 0) {
+            var bytes: [16]u8 = undefined;
+            engine.shared_io.getIo().random(&bytes);
+            const hex = std.fmt.bytesToHex(bytes, .lower);
+            s.wh_token = alloc.dupe(u8, &hex) catch return;
+            need_save = true;
+        }
+        var pb: [8]u8 = undefined;
+        const port_text = std.fmt.bufPrint(&pb, "{d}", .{s.wh_port}) catch "9781";
+        s.wh_port_buf.set(port_text);
+        if (s.wh_secret.len > 0) s.wh_secret_buf.set(s.wh_secret);
+        s.refreshWebhookUrl();
+        if (s.wh_enabled) s.applyWebhook(true);
+        if (need_save) s.saveWebhookConfig();
+    }
+
+    fn saveWebhookConfig(s: *State) void {
+        const engine = @import("fx");
+        const home = engine.shared_io.homeDir() orelse return;
+        const dir_path = alloc.print("{s}/.nanodot", .{home}) catch return;
+        defer alloc.free(dir_path);
+        std.Io.Dir.cwd().createDirPath(engine.shared_io.getIo(), dir_path) catch return;
+        const path = alloc.print("{s}/settings.json", .{dir_path}) catch return;
+        defer alloc.free(path);
+        const text = alloc.print("{{\"webhook\":{{\"enabled\":{s},\"port\":{d},\"token\":\"{s}\",\"secret\":\"{s}\"}}}}", .{
+            if (s.wh_enabled) "true" else "false",
+            s.wh_port,
+            s.wh_token,
+            s.wh_secret,
+        }) catch return;
+        defer alloc.free(text);
+        engine.shared_io.writeFileAtomic(alloc, path, text) catch {};
+    }
+
+    /// (Re)starts or stops the receiver to match the current config.
+    fn applyWebhook(s: *State, quiet: bool) void {
+        if (s.webhook) |server| {
+            server.stop();
+            s.webhook = null;
+        }
+        if (!s.wh_enabled) {
+            if (!quiet) s.whNote("webhook 已停止", false);
+            return;
+        }
+        const server = @import("webhook.zig").Server.create(s.wh_port, s.wh_token, s.wh_secret) catch {
+            if (!quiet) s.whNote("webhook 服务创建失败", true);
+            return;
+        };
+        server.start() catch |err| {
+            server.stop();
+            if (!quiet) s.whNote(alloc.print("端口 {d} 启动失败：{s}", .{ s.wh_port, @errorName(err) }) catch "启动失败", true);
+            return;
+        };
+        s.webhook = server;
+        if (!quiet) s.whNote(alloc.print("webhook 运行中：http://127.0.0.1:{d}/hook/{s}", .{ s.wh_port, s.wh_token }) catch "运行中", false);
+    }
+
+    /// Settings-page save: validate the port field, take the secret, persist
+    /// and restart the receiver.
+    pub fn saveWebhookFromForm(s: *State) void {
+        const port_text = std.mem.trimEnd(u8, s.wh_port_buf.text(), " \n\t");
+        const port = std.fmt.parseInt(u16, port_text, 10) catch {
+            s.whNote("端口应为 1024-65535 的数字", true);
+            return;
+        };
+        if (port < 1024) {
+            s.whNote("端口应在 1024-65535 之间", true);
+            return;
+        }
+        const secret = std.mem.trimEnd(u8, s.wh_secret_buf.text(), " \n\t");
+        const owned = alloc.dupe(u8, secret) catch return;
+        if (s.wh_secret.len > 0) alloc.free(s.wh_secret);
+        s.wh_secret = owned;
+        s.wh_port = port;
+        s.saveWebhookConfig();
+        s.refreshWebhookUrl();
+        s.applyWebhook(true);
+        s.whNote(if (s.wh_enabled) "已保存并应用，webhook 运行中" else "已保存；启用后生效", false);
+    }
+
+    pub fn toggleWebhook(s: *State) void {
+        s.wh_enabled = !s.wh_enabled;
+        s.saveWebhookConfig();
+        s.applyWebhook(true);
+        s.whNote(if (s.wh_enabled) "webhook 已启用并运行" else "webhook 已停用", false);
+    }
+
+    fn refreshWebhookUrl(s: *State) void {
+        var buf: [128]u8 = undefined;
+        const url = std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}/hook/{s}", .{ s.wh_port, s.wh_token }) catch return;
+        s.wh_url_buf.set(url);
+    }
+
+    /// A delivery from the receiver thread: log it, and wake the watcher
+    /// for the event's repo so the check runs within ~1s.
+    pub fn onWebhookEvent(s: *State, e: @import("webhook.zig").Event) void {
+        if (s.wh_events.items.len >= 20) {
+            const old = s.wh_events.orderedRemove(0);
+            @import("webhook.zig").freeEvent(old);
+        }
+        s.wh_events.append(alloc, e) catch {
+            @import("webhook.zig").freeEvent(e);
+            return;
+        };
+        if (e.repo.len > 0) {
+            for (s.watchers.items, 0..) |w, i| {
+                if (std.mem.eql(u8, w.info.repo, e.repo)) {
+                    s.checkWatcherNow(i);
+                    break;
+                }
+            }
+        }
+        if (s.window) |window| window.redraw();
+    }
+
+    fn whNote(s: *State, text: []const u8, fail: bool) void {
+        if (s.wh_note.len > 0) alloc.free(s.wh_note);
+        s.wh_note = alloc.dupe(u8, text) catch &.{};
+        s.wh_note_err = fail;
+        if (s.window) |window| window.redraw();
+    }
+
     /// The watch scheduler: re-arms itself every second and starts a check
     /// for each watcher whose interval came due (a Grok Bot-style routine:
-    /// the app wakes the agent on a schedule, the agent polls GitHub).
+    /// the app wakes the agent on a schedule, the agent polls GitHub). Also
+    /// drains webhook deliveries queued by the receiver thread.
     fn tickMain(context: ?*anyopaque) callconv(.c) void {
         const s: *State = @ptrCast(@alignCast(context.?));
         const now_ms = @import("fx").shared_io.milliTimestamp();
@@ -605,6 +1013,9 @@ pub const State = struct {
             if (!entry.enabled or entry.runtime.busy()) continue;
             if (now_ms < entry.next_fire_ms) continue;
             s.fireWatch(entry);
+        }
+        if (s.webhook) |server| {
+            while (server.pop()) |event| s.onWebhookEvent(event);
         }
         nanoui.App.after(1000, s, tickMain);
     }
@@ -625,7 +1036,27 @@ pub const State = struct {
         buf.appendSlice(alloc, "{\"watchers\":[") catch return;
         for (s.watchers.items, 0..) |entry, i| {
             if (i > 0) buf.appendSlice(alloc, ",") catch return;
-            const item = alloc.print("{{\"repo\":\"{s}\",\"prs\":{s},\"issues\":{s},\"interval_min\":{d},\"enabled\":{s},\"checks\":{d},\"findings\":{d}}}", .{
+            var ig: std.ArrayList(u8) = .empty;
+            defer ig.deinit(alloc);
+            ig.appendSlice(alloc, "[") catch return;
+            for (entry.ignored.items, 0..) |n, k| {
+                if (k > 0) ig.appendSlice(alloc, ",") catch return;
+                const piece = alloc.print("{d}", .{n}) catch return;
+                defer alloc.free(piece);
+                ig.appendSlice(alloc, piece) catch return;
+            }
+            ig.appendSlice(alloc, "]") catch return;
+            var rp: std.ArrayList(u8) = .empty;
+            defer rp.deinit(alloc);
+            rp.appendSlice(alloc, "[") catch return;
+            for (entry.reported.items, 0..) |n, k| {
+                if (k > 0) rp.appendSlice(alloc, ",") catch return;
+                const piece = alloc.print("{d}", .{n}) catch return;
+                defer alloc.free(piece);
+                rp.appendSlice(alloc, piece) catch return;
+            }
+            rp.appendSlice(alloc, "]") catch return;
+            const item = alloc.print("{{\"repo\":\"{s}\",\"prs\":{s},\"issues\":{s},\"interval_min\":{d},\"enabled\":{s},\"checks\":{d},\"findings\":{d},\"ignored\":{s},\"reported\":{s}}}", .{
                 entry.info.repo,
                 if (entry.info.watch_prs) "true" else "false",
                 if (entry.info.watch_issues) "true" else "false",
@@ -633,6 +1064,8 @@ pub const State = struct {
                 if (entry.enabled) "true" else "false",
                 entry.checks,
                 entry.findings,
+                ig.items,
+                rp.items,
             }) catch return;
             defer alloc.free(item);
             buf.appendSlice(alloc, item) catch return;
@@ -683,7 +1116,27 @@ pub const State = struct {
                 if (v == .integer) findings = @intCast(@max(0, @min(1_000_000, v.integer)));
             }
             const repo = alloc.dupe(u8, repo_v.string) catch continue;
-            if (s.bindWatcher(repo, prs, issues, interval, enabled, checks, findings) == null) continue;
+            const entry = s.bindWatcher(repo, prs, issues, interval, enabled, checks, findings) orelse continue;
+            if (obj.get("ignored")) |v| {
+                if (v == .array) {
+                    for (v.array.items) |n| {
+                        if (n == .integer) {
+                            const num: u32 = @intCast(@max(0, @min(1_000_000_000, n.integer)));
+                            entry.ignored.append(alloc, num) catch {};
+                        }
+                    }
+                }
+            }
+            if (obj.get("reported")) |v| {
+                if (v == .array) {
+                    for (v.array.items) |n| {
+                        if (n == .integer) {
+                            const num: u32 = @intCast(@max(0, @min(1_000_000_000, n.integer)));
+                            entry.reported.append(alloc, num) catch {};
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -933,6 +1386,14 @@ pub const State = struct {
         s.pushMessage(.{ .agent = null, .time = now(), .kind = .owner, .text = owner_line });
         const confirm = alloc.print("收到 {s}：{s} — {s}", .{ d.id, picked.detail, d.outcome }) catch return;
         s.pushMessage(.{ .agent = seed.hub, .time = now(), .kind = .note, .text = confirm });
+        if (d.watch) |w| {
+            // Option C (忽略) dismisses the numbers; A/B start a review.
+            if (option == 2) {
+                s.ignoreWatchFinding(w);
+            } else {
+                s.dispatchWatchReview(w, option == 1);
+            }
+        }
     }
 
     /// The composer submitted an instruction for the team; it runs in the
@@ -1084,7 +1545,11 @@ pub const State = struct {
                     @memcpy(grown[message.text.len + 1 ..], bytes);
                     message.text = grown;
                 } else {
-                    s.pushMessage(.{ .agent = seed.hub, .time = now(), .kind = .diag, .text = bytes });
+                    // Own the bytes: the event's buffer is freed once this
+                    // callback returns, and later growth of this card would
+                    // otherwise copy out of freed (possibly reallocated)
+                    // memory — which @memcpy rejects as aliasing.
+                    s.pushMessage(.{ .agent = seed.hub, .time = now(), .kind = .diag, .text = alloc.dupe(u8, bytes) catch return });
                     s.diag = @intCast(s.messages.items.len - 1);
                 }
             },
@@ -1147,6 +1612,45 @@ fn firstLine(text: []const u8) []const u8 {
     return line;
 }
 
+/// PR/issue numbers ("#1602") in a finding reply, unique, at most 8.
+fn parseNumbers(text: []const u8) []u32 {
+    var list: std.ArrayList(u32) = .empty;
+    errdefer list.deinit(alloc);
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] != '#' or i + 1 >= text.len or !std.ascii.isDigit(text[i + 1])) continue;
+        var value: u32 = 0;
+        var j = i + 1;
+        while (j < text.len and std.ascii.isDigit(text[j]) and j < i + 7) : (j += 1) {
+            value = value *% 10 +% (text[j] - '0');
+        }
+        var exists = false;
+        for (list.items) |n| {
+            if (n == value) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) list.append(alloc, value) catch {};
+        i = j;
+    }
+    return list.toOwnedSlice(alloc) catch &.{};
+}
+
+/// "#1602、#1603" for instructions and decision option text.
+fn formatNumbers(numbers: []const u32) []u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    for (numbers, 0..) |n, i| {
+        if (i > 0) buf.appendSlice(alloc, "、") catch {};
+        const piece = alloc.print("#{d}", .{n}) catch continue;
+        defer alloc.free(piece);
+        buf.appendSlice(alloc, piece) catch {};
+    }
+    if (buf.items.len == 0) buf.appendSlice(alloc, "新条目") catch {};
+    return buf.toOwnedSlice(alloc) catch alloc.dupe(u8, "新条目") catch @panic("oom");
+}
+
 /// Reads a file fully, or null on any failure. Caller frees the result.
 fn readFile(path: []const u8) ?[]u8 {
     const engine = @import("fx");
@@ -1168,3 +1672,50 @@ pub fn hhmm(buf: []u8, ms: i64) []const u8 {
 fn now() []const u8 {
     return hhmm(&clock_buf, @import("fx").shared_io.milliTimestamp());
 }
+
+test "watcher finding becomes a decision; ignore dismisses its numbers" {
+    const engine = @import("fx");
+    const home = engine.shared_io.homeDir() orelse return;
+    const dir_path = try alloc.print("{s}/.nanodot", .{home});
+    defer alloc.free(dir_path);
+    const path = try alloc.print("{s}/watchers.json", .{dir_path});
+    defer alloc.free(path);
+    const preexisting = blk: {
+        const io = engine.shared_io.getIo();
+        var f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch break :blk false;
+        f.close(io);
+        break :blk true;
+    };
+
+    const s = try State.create();
+    defer s.destroy();
+    const repo = try alloc.dupe(u8, "o/r");
+    const entry = s.bindWatcher(repo, true, false, 15, true, 0, 0).?;
+    try std.testing.expectEqual(@as(usize, 3), s.pendingCount());
+
+    const reply = "发现新 PR：\n#12 Alpha — https://x/12\n#34 Beta — https://x/34\n共 2 条新动态";
+    const numbers = parseNumbers(reply);
+    try std.testing.expectEqualSlices(u32, &.{ 12, 34 }, numbers);
+    s.pushWatchDecision(entry, reply, numbers);
+    try std.testing.expectEqual(@as(usize, 4), s.decisions.items.len);
+    try std.testing.expectEqual(@as(usize, 4), s.pendingCount());
+    const di = s.decisions.items.len - 1;
+    const w = s.decisions.items[di].watch;
+    try std.testing.expect(w != null);
+    try std.testing.expectEqualSlices(u32, &.{ 12, 34 }, w.?.numbers);
+
+    // Option C: ignore — numbers join the watcher's persisted ignore list.
+    s.choose(di, 2);
+    try std.testing.expect(s.decisions.items[di].choice != null);
+    try std.testing.expectEqual(@as(usize, 2), entry.ignored.items.len);
+    const data = readFile(path) orelse return error.TestUnexpectedResult;
+    defer alloc.free(data);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"ignored\":[12,34]") != null);
+
+    if (!preexisting) {
+        const io = engine.shared_io.getIo();
+        std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+        std.Io.Dir.deleteDirAbsolute(io, dir_path) catch {};
+    }
+}
+

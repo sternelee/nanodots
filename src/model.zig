@@ -25,6 +25,23 @@ pub const Decision = struct {
     choice: ?usize = null,
     /// The instruction sent back to the team on resolve, for the confirm line.
     outcome: []const u8,
+    /// Set for dynamically-created decisions (watcher findings): their
+    /// strings are heap-owned and freed when the app shuts down.
+    owned: bool = false,
+    /// Watcher findings: which follow-up runs when an option is picked.
+    watch: ?WatchRef = null,
+};
+
+/// A watcher finding's follow-up target. `watcher` indexes State.watchers
+/// and is validated against `repo` before anything runs.
+pub const WatchRef = struct {
+    watcher: usize,
+    repo: []const u8,
+    /// PR/issue numbers parsed from the finding reply.
+    numbers: []const u32,
+    /// A short excerpt of the finding, the review's context when no
+    /// numbers could be parsed.
+    context: []const u8,
 };
 
 pub const TaskStatus = enum {

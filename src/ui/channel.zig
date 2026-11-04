@@ -53,7 +53,11 @@ fn messages(s: *State, c: *ui.Context) void {
     // the newest message unless the owner scrolled up.
     _ = c.open(.{ .direction = .column, .width = .fill, .grow = 1, .scroll = true, .follow_end = true }, null);
     const col = ui.div(c).column().wFull().gap(18).p(18);
-    for (s.messages.items, 0..) |m, i| {
+    // Index-based walk: choosing a decision option pushes messages from
+    // inside the loop (choose → confirm), which may grow the list mid-frame.
+    var i: usize = 0;
+    while (i < s.messages.items.len) : (i += 1) {
+        const m = s.messages.items[i];
         ui.keyInt(c, i);
         switch (m.kind) {
             .note => note(c, m),
@@ -80,7 +84,7 @@ pub fn note(c: *ui.Context, m: model.Message) void {
         const col = ui.div(c).column().grow().minW(0).gap(3);
         {
             const head = ui.div(c).row().itemsCenter().gap(8);
-            ui.text(c, m.agent.?.name, .{ .size = 13, .weight = .semibold, .color = common.hx(common.text) });
+            ui.text(c, if (m.agent) |a| a.name else "团队", .{ .size = 13, .weight = .semibold, .color = common.hx(common.text) });
             ui.text(c, m.time, .{ .size = 11, .color = common.hx(common.faint), .tabular = true });
             head.end();
         }

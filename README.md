@@ -16,8 +16,18 @@ every project also opens an interactive multi-turn agent session — like fx
 cli or an editor chat panel in that directory. Watches poll GitHub repos on a
 schedule (a Grok Bot-style routine): at each interval the app wakes a dedicated
 fx session that checks the repo with `gh` (or the GitHub API), reports new
-PRs/issues to the channel and stays quiet when nothing changed; the watch list
-persists in `~/.nanodot/watchers.json`. The gear at the sidebar's bottom opens
+PRs/issues to the channel and stays quiet when nothing changed. Findings land
+as decision cards — 快速审阅 / 派任务 / 忽略: A and B start a real review turn
+on the team runtime (quick pass or full structured report), C puts the PR
+numbers on the watcher's persisted ignore list so they are never reported
+again. Reported numbers are persisted too, so restarts diff against them
+instead of the fx session's memory. For instant notification the settings page
+also runs a GitHub webhook receiver (Rerun's inbound pattern, desktop-sized):
+it listens on 127.0.0.1, verifies `X-Hub-Signature-256` when a secret is set,
+wakes the matching watcher within a second, and shows the hook URL, setup
+instructions and recent deliveries; expose the port with smee.io or ngrok for
+GitHub to reach it. The watch list, ignore lists and webhook config live in
+`~/.nanodot/`. The gear at the sidebar's bottom opens
 the agent settings page: the fx provider, model and custom base_url providers,
 read and written through fx's own `~/.fx/settings.json`.
 
@@ -65,8 +75,12 @@ failure is reported into the channel as a normal message.
   agent settings page's read/write of ~/.fx/settings.json, the projects and
   their per-directory fx runtimes, and the repo watches: a 1-second scheduler
   (`nanoui.App.after`) wakes a dedicated fx session per watcher, the reply is
-  parsed (无新动态 stays quiet, findings go to the channel), the list is
-  persisted to `~/.nanodot/watchers.json`
+  parsed (无新动态 stays quiet, findings become decision cards), the list,
+  ignore and reported numbers persist to `~/.nanodot/watchers.json`; also the
+  webhook receiver's lifecycle, settings and per-second drain
+- `src/webhook.zig` — the GitHub webhook receiver: a 127.0.0.1 HTTP server
+  (`std.Io.net`) accepting POSTs to /hook/<token>, optional
+  X-Hub-Signature-256 verification, events queued for the UI thread
 - `src/seed.zig` — the demo workspace (decisions, tasks, hosts, messages)
 - `src/ui/` — sidebar, channel (decision cards, composer), task page, host
   page, agent settings page, projects list and project pages, watch list and
